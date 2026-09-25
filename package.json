@@ -1,0 +1,15 @@
+{
+  "name": "nepali-news",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c yellow,cyan \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "dev:api": "npm run dev --prefix backend",
+    "dev:web": "npm run dev --prefix frontend",
+    "types": "npm exec --prefix backend -- tsc --noEmit --project backend/tsconfig.json && npm exec --prefix frontend -- tsc --noEmit --project frontend/tsconfig.json",
+    "lint:web": "npm run lint --prefix frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
