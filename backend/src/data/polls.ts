@@ -46,31 +46,33 @@ const summarize = (record: PollRecord): PollResults => {
   return { counts: { ...record.counts }, total };
 };
 
+const resolveDefinition = (
+  pollId: string
+): Pick<PollRecord, "question" | "options" | "context"> | null => {
+  if (pollId === "default") {
+    return { question: DEFAULT_QUESTION, options: DEFAULT_OPTIONS };
+  }
+  const current = generatePoll();
+  if (current.id === pollId) {
+    return { question: current.question, options: current.options, context: current.context };
+  }
+  return null;
+};
+
 const ensureRecord = (pollId: string): PollRecord => {
   const existing = records.get(pollId);
   if (existing) return existing;
 
-  let question = "";
-  let options: Poll["options"] = [];
-  let context: Poll["context"] | undefined;
-
-  if (pollId === "default") {
-    question = DEFAULT_QUESTION;
-    options = DEFAULT_OPTIONS;
-  } else {
-    const current = generatePoll();
-    if (current.id === pollId) {
-      question = current.question;
-      options = current.options;
-      context = current.context;
-    }
+  const definition = resolveDefinition(pollId);
+  if (!definition) {
+    throw new UnknownPollError();
   }
 
   const record: PollRecord = {
     id: pollId,
-    question: question || "मतदान",
-    options,
-    context,
+    question: definition.question,
+    options: definition.options,
+    context: definition.context,
     counts: {},
     voters: new Set(),
   };
@@ -78,16 +80,29 @@ const ensureRecord = (pollId: string): PollRecord => {
   return record;
 };
 
+export class UnknownPollError extends Error {
+  constructor() {
+    super("Unknown poll");
+    this.name = "UnknownPollError";
+  }
+}
+
 export const castVote = (
   pollId: string,
   optionId: string,
   voterKey: string
 ): VoteOutcome => {
-  const record = ensureRecord(pollId);
-  if (
-    record.options.length > 0 &&
-    !record.options.some((o) => o.id === optionId)
-  ) {
+  let record: PollRecord;
+  try {
+    record = ensureRecord(pollId);
+  } catch (error) {
+    if (error instanceof UnknownPollError) {
+      return { ok: false, error: "मतदान फेला परेन।", alreadyVoted: false };
+    }
+    throw error;
+  }
+
+  if (!record.options.some((o) => o.id === optionId)) {
     return { ok: false, error: "अवैध मतदान विकल्प।", alreadyVoted: false };
   }
   if (record.voters.has(voterKey)) {

@@ -79,6 +79,29 @@ export const verifyPassword = async (
   return crypto.timingSafeEqual(a, b);
 };
 
+// A fixed decoy so an unknown email still pays the full scrypt cost and
+// cannot be distinguished from a known one by response time.
+const DECOY_HASH = `${"0".repeat(32)}:${"0".repeat(128)}`;
+
+/**
+ * Verifies a password against a user, or against a decoy when the account
+ * does not exist, so the timing of both branches matches.
+ */
+export const verifyLoginPassword = async (
+  password: string,
+  user: User | undefined
+): Promise<boolean> => {
+  if (!user) {
+    try {
+      await verifyPassword(password, DECOY_HASH);
+    } catch {
+      // ignore: the decoy exists only to consume time
+    }
+    return false;
+  }
+  return verifyPassword(password, user.passwordHash);
+};
+
 export const createSession = (userId: string): string => {
   const token = crypto.randomBytes(32).toString("hex");
   userSessions.set(token, { userId, createdAt: Date.now() });
