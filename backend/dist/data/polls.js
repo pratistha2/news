@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.listAdminPolls = exports.getPollResults = exports.castVote = void 0;
+exports.listAdminPolls = exports.getPollResults = exports.castVote = exports.UnknownPollError = void 0;
 const poll_1 = require("../poll");
 const DEFAULT_QUESTION = "अहिलेको प्रधानमन्त्रीका रूपमा को उपयुक्त लाग्छ?";
 const DEFAULT_OPTIONS = [
@@ -16,40 +16,54 @@ const summarize = (record) => {
         total += value;
     return { counts: { ...record.counts }, total };
 };
+const resolveDefinition = (pollId) => {
+    if (pollId === "default") {
+        return { question: DEFAULT_QUESTION, options: DEFAULT_OPTIONS };
+    }
+    const current = (0, poll_1.generatePoll)();
+    if (current.id === pollId) {
+        return { question: current.question, options: current.options, context: current.context };
+    }
+    return null;
+};
 const ensureRecord = (pollId) => {
     const existing = records.get(pollId);
     if (existing)
         return existing;
-    let question = "";
-    let options = [];
-    let context;
-    if (pollId === "default") {
-        question = DEFAULT_QUESTION;
-        options = DEFAULT_OPTIONS;
-    }
-    else {
-        const current = (0, poll_1.generatePoll)();
-        if (current.id === pollId) {
-            question = current.question;
-            options = current.options;
-            context = current.context;
-        }
+    const definition = resolveDefinition(pollId);
+    if (!definition) {
+        throw new UnknownPollError();
     }
     const record = {
         id: pollId,
-        question: question || "मतदान",
-        options,
-        context,
+        question: definition.question,
+        options: definition.options,
+        context: definition.context,
         counts: {},
         voters: new Set(),
     };
     records.set(pollId, record);
     return record;
 };
+class UnknownPollError extends Error {
+    constructor() {
+        super("Unknown poll");
+        this.name = "UnknownPollError";
+    }
+}
+exports.UnknownPollError = UnknownPollError;
 const castVote = (pollId, optionId, voterKey) => {
-    const record = ensureRecord(pollId);
-    if (record.options.length > 0 &&
-        !record.options.some((o) => o.id === optionId)) {
+    let record;
+    try {
+        record = ensureRecord(pollId);
+    }
+    catch (error) {
+        if (error instanceof UnknownPollError) {
+            return { ok: false, error: "मतदान फेला परेन।", alreadyVoted: false };
+        }
+        throw error;
+    }
+    if (!record.options.some((o) => o.id === optionId)) {
         return { ok: false, error: "अवैध मतदान विकल्प।", alreadyVoted: false };
     }
     if (record.voters.has(voterKey)) {

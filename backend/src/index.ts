@@ -30,6 +30,9 @@ import {
   normalizeEmail,
   resetUserPassword,
   toPublicUser,
+  createUnverifiedUser,
+  createVerificationToken,
+  verifyUserEmail,
   verifyLoginPassword,
 } from "./data/users";
 
@@ -88,8 +91,9 @@ const SMTP_SECURE =
     ? SMTP_PORT === 465
     : /^(1|true|yes)$/i.test(process.env.SMTP_SECURE);
 const SMTP_HOST = process.env.SMTP_HOST;
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
+const SMTP_USER = process.env.SMTP_USER ?? process.env.EMAIL_USER ?? "";
+const SMTP_PASSWORD =
+  process.env.SMTP_PASSWORD ?? process.env.EMAIL_PASS ?? "";
 const MAIL_FROM = process.env.MAIL_FROM;
 
 const ADMIN_SESSION_TTL_MS =
@@ -247,6 +251,15 @@ const AUTH_WINDOW_MS = 5 * 60_000;
 const AUTH_RATE_LIMIT = clampInt(process.env.AUTH_RATE_LIMIT, 3, 1000, 20);
 const authBuckets = new Map<string, { count: number; resetAt: number }>();
 
+const escapeHtml = (input: string): string =>
+  String(input)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+
+
 function authRateLimit(req: Request, res: Response, next: NextFunction) {
   const now = Date.now();
   if (authBuckets.size > 5000) {
@@ -283,6 +296,13 @@ const PASSWORD_RESET_TTL_MINUTES = clampInt(
   5,
   120,
   30
+);
+
+const EMAIL_VERIFICATION_TTL_MINUTES = clampInt(
+  process.env.EMAIL_VERIFICATION_TTL_MINUTES,
+  5,
+  1440,
+  60
 );
 
 const smtpTransport =
@@ -325,6 +345,46 @@ const sendPasswordResetEmail = async (input: {
     ].join("\n"),
   });
 };
+const sendVerificationEmail = async (input: {
+  to: string;
+  name: string;
+  token: string;
+}): Promise<void> => {
+  if (!smtpTransport || !MAIL_FROM) {
+    throw new Error("SMTP is not configured");
+  }
+
+  const verifyUrl = new URL("/verify-email", ORIGIN);
+  verifyUrl.searchParams.set("token", input.token);
+
+  await smtpTransport.sendMail({
+    from: MAIL_FROM,
+    to: input.to,
+    subject: "Verify your news account email",
+    text: [
+      `Hello ${input.name},`,
+      "",
+      "Thanks for signing up. Please verify your email address by clicking the link below.",
+      `This link expires in ${EMAIL_VERIFICATION_TTL_MINUTES} minutes.`,
+      "",
+      verifyUrl.toString(),
+      "",
+      "If you didn't create an account, you can safely ignore this email.",
+    ].join("\n"),
+    html: `
+      <p>Hello ${escapeHtml(input.name)},</p>
+      <p>Thanks for signing up. Please verify your email address by clicking the button below.</p>
+      <p style="margin: 24px 0;">
+        <a href="${verifyUrl.toString()}" style="background: #e41e24; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px;">
+          Verify Email
+        </a>
+      </p>
+      <p>This link expires in ${EMAIL_VERIFICATION_TTL_MINUTES} minutes.</p>
+      <p>If you didn't create an account, you can safely ignore this email.</p>
+    `,
+  });
+};
+
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({
@@ -693,26 +753,43 @@ app.post(
     res.status(400).json({ message: "पासवर्ड कम्तीमा ८ अक्षरको हुनुपर्छ।" });
     return;
   }
+
   const existing = findUserByEmail(email);
   if (existing) {
-    // Uniform response: a distinct status here would confirm which addresses
-    // are registered to anyone probing the endpoint.
+    if (!existing.verifiedAt && existing.verificationTokenExpiresAt && existing.verificationTokenExpiresAt < Date.now()) {
+      existing.verificationTokenHash = null;
+      existing.verificationTokenExpiresAt = null;
+    }
+    if (!existing.verifiedAt && !existing.verificationTokenHash) {
+      try {
+        const token = createVerificationToken(
+          existing.id,
+          EMAIL_VERIFICATION_TTL_MINUTES * 60_000
+        );
+        await sendVerificationEmail({ to: existing.email, name: existing.name, token });
+      } catch (error) {
+        console.error("Resend verification email failed:", error);
+      }
+    }
     res.status(200).json({
-      message: "यदि यो इमेल उपलब्ध छ भने खाता सक्रिय हुन्छ। अब प्रवेश गर्नुहोस्।",
+      message: "यदि यो इमेल उपलब्ध छ भने प्रमाणीकरण लिंक पठाइएको छ। आफ्नो इमेल जाँच गर्नुहोस्।",
     });
     return;
   }
 
   try {
-    const user = await createUser({
+    const user = await createUnverifiedUser({
       name: name.trim(),
       email: normalizeEmail(email),
       password,
     });
-    const token = createSession(user.id);
+    const token = createVerificationToken(
+      user.id,
+      EMAIL_VERIFICATION_TTL_MINUTES * 60_000
+    );
+    await sendVerificationEmail({ to: user.email, name: user.name, token });
     res.status(201).json({
-      data: { token, user: toPublicUser(user) },
-      message: "खाता सफलतापूर्वक बनाइयो।",
+      message: "खाता सफलतापूर्वक बनाइयो। इमेलमा प्रमाणीकरण लिंक पठाइएको छ।",
     });
   } catch (error) {
     console.error("Registration failed:", error);
@@ -743,6 +820,13 @@ app.post(
 
   if (!user || !valid) {
     res.status(401).json({ message: "इमेल वा पासवर्ड गलत छ।" });
+    return;
+  }
+
+  if (!user.verifiedAt) {
+    res.status(403).json({
+      message: "इमेल प्रमाणीकरण गरिसकिएको छैन। आफ्नो इमेल जाँच गरेर प्रमाणीकरण लिंक क्लिक गर्नुहोस्।",
+    });
     return;
   }
 
@@ -830,6 +914,70 @@ app.get("/api/auth/me", requireUser, (req: Request, res: Response) => {
   const user = currentUser(req);
   res.json({ data: toPublicUser(user as NonNullable<typeof user>) });
 });
+
+
+app.post(
+  "/api/auth/verify-email",
+  authRateLimit,
+  asyncRoute(async (req: Request, res: Response) => {
+    const { token } = req.body ?? {};
+    const t = typeof token === "string" ? token.trim() : "";
+
+    if (!t || t.length > 256) {
+      res.status(400).json({ message: "इमेल प्रमाणीकरण लिंक अमान्य वा म्याद सकिएको छ।" });
+      return;
+    }
+
+    try {
+      const ok = await verifyUserEmail(t);
+      if (!ok) {
+        res.status(400).json({ message: "इमेल प्रमाणीकरण लिंक अमान्य वा म्याद सकिएको छ।" });
+        return;
+      }
+      res.json({ message: "इमेल सफलतापूर्वक प्रमाणीकरण भयो। अब प्रवेश गर्न सक्नुहुन्छ।" });
+    } catch (error) {
+      console.error("Email verification failed:", error);
+      res.status(500).json({ message: "इमेल प्रमाणीकरण गर्न सकिएन। पछि पुनः प्रयास गर्नुहोस्।" });
+    }
+  })
+);
+
+app.post(
+  "/api/auth/resend-verification",
+  authRateLimit,
+  asyncRoute(async (req: Request, res: Response) => {
+    const { email } = req.body ?? {};
+    const responseMessage =
+      "यदि यो इमेल दर्ता भएको छ भने प्रमाणीकरण लिंक पठाइएको छ।";
+
+    if (typeof email !== "string" || !isValidEmail(email)) {
+      res.status(400).json({ message: "वैध इमेल ठेगाना आवश्यक छ।" });
+      return;
+    }
+
+    const user = findUserByEmail(email);
+    if (user && !user.verifiedAt) {
+      if (user.verificationTokenExpiresAt && user.verificationTokenExpiresAt > Date.now()) {
+        res.status(200).json({ message: responseMessage });
+        return;
+      }
+      try {
+        const token = createVerificationToken(
+          user.id,
+          EMAIL_VERIFICATION_TTL_MINUTES * 60_000
+        );
+        await sendVerificationEmail({ to: user.email, name: user.name, token });
+      } catch (error) {
+        console.error("Resend verification email failed:", error);
+      }
+    } else {
+      await verifyLoginPassword("", undefined);
+    }
+
+    res.status(200).json({ message: responseMessage });
+  })
+);
+
 
 app.post(
   "/api/admin/login",

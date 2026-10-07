@@ -6,6 +6,9 @@ export interface User {
   email: string;
   passwordHash: string;
   createdAt: string;
+  verifiedAt: string | null;
+  verificationTokenHash: string | null;
+  verificationTokenExpiresAt: number | null;
 }
 
 export interface PublicUser {
@@ -13,6 +16,7 @@ export interface PublicUser {
   name: string;
   email: string;
   createdAt: string;
+  verified: boolean;
 }
 
 const users: User[] = [];
@@ -31,7 +35,7 @@ interface PasswordResetToken {
 
 const passwordResetTokens = new Map<string, PasswordResetToken>();
 
-const hashResetToken = (token: string): string =>
+const hashToken = (token: string): string =>
   crypto.createHash("sha256").update(token).digest("hex");
 
 const nextId = (): string => {
@@ -79,14 +83,8 @@ export const verifyPassword = async (
   return crypto.timingSafeEqual(a, b);
 };
 
-// A fixed decoy so an unknown email still pays the full scrypt cost and
-// cannot be distinguished from a known one by response time.
 const DECOY_HASH = `${"0".repeat(32)}:${"0".repeat(128)}`;
 
-/**
- * Verifies a password against a user, or against a decoy when the account
- * does not exist, so the timing of both branches matches.
- */
 export const verifyLoginPassword = async (
   password: string,
   user: User | undefined
@@ -95,7 +93,7 @@ export const verifyLoginPassword = async (
     try {
       await verifyPassword(password, DECOY_HASH);
     } catch {
-      // ignore: the decoy exists only to consume time
+      // ignore
     }
     return false;
   }
@@ -126,7 +124,7 @@ export const createPasswordResetToken = (
   }
 
   const token = crypto.randomBytes(32).toString("hex");
-  passwordResetTokens.set(hashResetToken(token), {
+  passwordResetTokens.set(hashToken(token), {
     userId,
     expiresAt: Date.now() + ttlMs,
   });
@@ -143,7 +141,7 @@ export const resetUserPassword = async (
   token: string,
   password: string
 ): Promise<boolean> => {
-  const tokenHash = hashResetToken(token);
+  const tokenHash = hashToken(token);
   const reset = passwordResetTokens.get(tokenHash);
   if (!reset) return false;
 
@@ -158,6 +156,60 @@ export const resetUserPassword = async (
   return true;
 };
 
+export const createVerificationToken = (
+  userId: string,
+  ttlMs: number
+): string => {
+  const user = users.find((u) => u.id === userId);
+  if (!user) return "";
+
+  user.verificationTokenHash = null;
+  user.verificationTokenExpiresAt = null;
+
+  const token = crypto.randomBytes(32).toString("hex");
+  user.verificationTokenHash = hashToken(token);
+  user.verificationTokenExpiresAt = Date.now() + ttlMs;
+  return token;
+};
+
+export const verifyUserEmail = async (token: string): Promise<boolean> => {
+  if (!token) return false;
+  const tokenHash = hashToken(token);
+  const user = users.find(
+    (u) =>
+      u.verificationTokenHash === tokenHash &&
+      u.verificationTokenExpiresAt !== null &&
+      u.verificationTokenExpiresAt > Date.now()
+  );
+  if (!user) return false;
+
+  user.verifiedAt = new Date().toISOString();
+  user.verificationTokenHash = null;
+  user.verificationTokenExpiresAt = null;
+  return true;
+};
+
+export const isUserVerified = (user: User): boolean => !!user.verifiedAt;
+
+export const createUnverifiedUser = async (input: {
+  name: string;
+  email: string;
+  password: string;
+}): Promise<User> => {
+  const user: User = {
+    id: nextId(),
+    name: input.name.trim(),
+    email: normalizeEmail(input.email),
+    passwordHash: await hashPassword(input.password),
+    createdAt: new Date().toISOString(),
+    verifiedAt: null,
+    verificationTokenHash: null,
+    verificationTokenExpiresAt: null,
+  };
+  users.push(user);
+  return user;
+};
+
 export const createUser = async (input: {
   name: string;
   email: string;
@@ -169,6 +221,9 @@ export const createUser = async (input: {
     email: normalizeEmail(input.email),
     passwordHash: await hashPassword(input.password),
     createdAt: new Date().toISOString(),
+    verifiedAt: new Date().toISOString(),
+    verificationTokenHash: null,
+    verificationTokenExpiresAt: null,
   };
   users.push(user);
   return user;
@@ -189,6 +244,7 @@ export const toPublicUser = (user: User): PublicUser => ({
   name: user.name,
   email: user.email,
   createdAt: user.createdAt,
+  verified: isUserVerified(user),
 });
 
 export const listUsers = (): PublicUser[] => users.map(toPublicUser);

@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.deleteUser = exports.countUsers = exports.listUsers = exports.toPublicUser = exports.getSessionUser = exports.createUser = exports.resetUserPassword = exports.createPasswordResetToken = exports.findUserByEmail = exports.destroySession = exports.createSession = exports.verifyPassword = exports.hashPassword = exports.isValidEmail = exports.EMAIL_PATTERN = exports.normalizeEmail = exports.userSessions = void 0;
+exports.deleteUser = exports.countUsers = exports.listUsers = exports.toPublicUser = exports.getSessionUser = exports.createUser = exports.resetUserPassword = exports.createPasswordResetToken = exports.findUserByEmail = exports.destroySession = exports.createSession = exports.verifyLoginPassword = exports.verifyPassword = exports.hashPassword = exports.isValidEmail = exports.EMAIL_PATTERN = exports.normalizeEmail = exports.userSessions = void 0;
 const crypto_1 = __importDefault(require("crypto"));
 const users = [];
 let sequence = 0;
@@ -48,6 +48,26 @@ const verifyPassword = async (password, stored) => {
     return crypto_1.default.timingSafeEqual(a, b);
 };
 exports.verifyPassword = verifyPassword;
+// A fixed decoy so an unknown email still pays the full scrypt cost and
+// cannot be distinguished from a known one by response time.
+const DECOY_HASH = `${"0".repeat(32)}:${"0".repeat(128)}`;
+/**
+ * Verifies a password against a user, or against a decoy when the account
+ * does not exist, so the timing of both branches matches.
+ */
+const verifyLoginPassword = async (password, user) => {
+    if (!user) {
+        try {
+            await (0, exports.verifyPassword)(password, DECOY_HASH);
+        }
+        catch {
+            // ignore: the decoy exists only to consume time
+        }
+        return false;
+    }
+    return (0, exports.verifyPassword)(password, user.passwordHash);
+};
+exports.verifyLoginPassword = verifyLoginPassword;
 const createSession = (userId) => {
     const token = crypto_1.default.randomBytes(32).toString("hex");
     exports.userSessions.set(token, { userId, createdAt: Date.now() });

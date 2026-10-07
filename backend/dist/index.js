@@ -8,6 +8,7 @@ const crypto_1 = __importDefault(require("crypto"));
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const nodemailer_1 = __importDefault(require("nodemailer"));
+const admin_1 = require("./admin");
 const news_1 = require("./data/news");
 const personalities_1 = require("./data/personalities");
 const translit_1 = require("./translit");
@@ -17,11 +18,37 @@ const submissions_1 = require("./data/submissions");
 const users_1 = require("./data/users");
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 4000;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const clampInt = (value, min, max, fallback) => {
+    if (!value)
+        return fallback;
+    const parsed = parseInt(value, 10);
+    if (Number.isNaN(parsed))
+        return fallback;
+    return Math.min(max, Math.max(min, parsed));
+};
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS ?? "")
     .split(",")
     .map((o) => o.trim())
     .filter(Boolean);
+// Fail closed: an empty CORS_ORIGINS only opens localhost in development.
+// In production an unset value rejects every cross-origin browser request.
+const DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+];
+const CORS_ALLOWLIST = ALLOWED_ORIGINS.length
+    ? ALLOWED_ORIGINS
+    : IS_PRODUCTION
+        ? []
+        : DEV_ORIGINS;
 const ORIGIN = process.env.SITE_URL ?? "http://localhost:3000";
+const TRUST_PROXY = process.env.TRUST_PROXY;
+if (TRUST_PROXY) {
+    const hops = parseInt(TRUST_PROXY, 10);
+    app.set("trust proxy", Number.isNaN(hops) ? TRUST_PROXY : hops);
+}
+const INTERNAL_API_TOKEN = (process.env.INTERNAL_API_TOKEN ?? "").trim();
 const configuredSmtpPort = Number(process.env.SMTP_PORT ?? 587);
 const SMTP_PORT = Number.isInteger(configuredSmtpPort) &&
     configuredSmtpPort > 0 &&
@@ -35,12 +62,24 @@ const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
 const MAIL_FROM = process.env.MAIL_FROM;
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? "pratistha.sapkota123@gmail.com";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "admin123";
-const adminSessions = new Map();
+const ADMIN_SESSION_TTL_MS = clampInt(process.env.ADMIN_SESSION_TTL_MINUTES, 5, 24 * 60, 12 * 60) * 60000;
+const adminAuth = admin_1.AdminAuth.create({
+    email: process.env.ADMIN_EMAIL,
+    password: process.env.ADMIN_PASSWORD,
+    passwordHash: process.env.ADMIN_PASSWORD_HASH,
+    sessionTtlMs: ADMIN_SESSION_TTL_MS,
+    maxFailures: clampInt(process.env.ADMIN_MAX_FAILURES, 1, 20, 5),
+    lockoutMs: clampInt(process.env.ADMIN_LOCKOUT_MINUTES, 1, 120, 15) * 60000,
+    maxAttemptsPerIp: clampInt(process.env.ADMIN_MAX_ATTEMPTS_PER_IP, 1, 200, 20),
+});
 let newsFeed = [...news_1.news];
 let newsSeq = 0;
 app.disable("x-powered-by");
+const asyncRoute = (handler) => (req, res, next) => {
+    handler(req, res, next).catch(next);
+};
+/** Express parses repeated query params into an array; never assume string. */
+const queryText = (value, max = 200) => typeof value === "string" ? value.slice(0, max) : "";
 app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
@@ -51,76 +90,114 @@ app.use((_req, res, next) => {
 });
 app.use((0, cors_1.default)({
     origin(origin, callback) {
-        if (!origin || ALLOWED_ORIGINS.length === 0) {
+        // No Origin header: same-origin navigation, curl, or server-to-server.
+        // CORS is a browser control, so these are allowed through.
+        if (!origin) {
             callback(null, true);
             return;
         }
-        if (ALLOWED_ORIGINS.includes(origin)) {
+        if (CORS_ALLOWLIST.length === 0) {
+            callback(new Error("CORS not allowed for this origin"));
+            return;
+        }
+        if (CORS_ALLOWLIST.includes(origin)) {
             callback(null, true);
             return;
         }
         callback(new Error("CORS not allowed for this origin"));
     },
     methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "x-user-token", "x-admin-token", "x-internal-token"],
+    exposedHeaders: ["Retry-After"],
     maxAge: 600,
 }));
 app.use(express_1.default.json({ limit: "100kb" }));
 const WINDOW_MS = 60000;
-const ipKey = (req) => req.ip ||
-    req.socket.remoteAddress ||
-    "unknown";
-const RATE_LIMIT = Number(process.env.RATE_LIMIT ?? 120);
-const rateBuckets = new Map();
-function rateLimit(req, res, next) {
-    const key = ipKey(req);
+const ipKey = (req) => req.ip || req.socket.remoteAddress || "unknown";
+/**
+ * Server-to-server calls from the Next.js server all share one IP, so the
+ * public bucket would throttle the whole site. When INTERNAL_API_TOKEN is
+ * configured, the frontend presents it and those calls get their own,
+ * much larger budget. Unset means no bypass at all.
+ */
+const INTERNAL_BYPASS_BUDGET = Number(process.env.INTERNAL_RATE_LIMIT ?? 6000);
+const internalBuckets = new Map();
+const isInternalRequest = (req) => {
+    if (!INTERNAL_API_TOKEN)
+        return false;
+    const presented = req.headers["x-internal-token"];
+    if (typeof presented !== "string" || !presented)
+        return false;
+    if (!(0, admin_1.safeEquals)(presented, INTERNAL_API_TOKEN))
+        return false;
     const now = Date.now();
-    const bucket = rateBuckets.get(key);
+    const key = ipKey(req);
+    const bucket = internalBuckets.get(key);
     if (!bucket || bucket.resetAt < now) {
+        internalBuckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
+        return true;
+    }
+    bucket.count += 1;
+    return bucket.count <= INTERNAL_BYPASS_BUDGET;
+};
+const RATE_LIMIT = clampInt(process.env.RATE_LIMIT, 10, 100000, 120);
+const rateBuckets = new Map();
+const RATE_BUCKET_MAX = 10000;
+function rateLimit(req, res, next) {
+    if (isInternalRequest(req)) {
+        next();
+        return;
+    }
+    const now = Date.now();
+    if (rateBuckets.size > RATE_BUCKET_MAX) {
+        for (const [k, b] of rateBuckets) {
+            if (b.resetAt <= now)
+                rateBuckets.delete(k);
+        }
+    }
+    const key = ipKey(req);
+    const bucket = rateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
         rateBuckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
         next();
         return;
     }
     bucket.count += 1;
     if (bucket.count > RATE_LIMIT) {
+        const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+        res.setHeader("Retry-After", String(retryAfter));
         res.status(429).json({ message: "धेरै धेरै अनुरोध भयो। केही बेरपछि पुनः प्रयास गर्नुहोस्।" });
         return;
-    }
-    if (rateBuckets.size > 5000) {
-        for (const [k, b] of rateBuckets) {
-            if (b.resetAt < now)
-                rateBuckets.delete(k);
-        }
     }
     next();
 }
 app.use("/api", rateLimit);
 const AUTH_WINDOW_MS = 5 * 60000;
-const AUTH_RATE_LIMIT = Number(process.env.AUTH_RATE_LIMIT ?? 20);
+const AUTH_RATE_LIMIT = clampInt(process.env.AUTH_RATE_LIMIT, 3, 1000, 20);
 const authBuckets = new Map();
 function authRateLimit(req, res, next) {
-    const key = ipKey(req);
     const now = Date.now();
+    if (authBuckets.size > 5000) {
+        for (const [k, b] of authBuckets) {
+            if (b.resetAt <= now)
+                authBuckets.delete(k);
+        }
+    }
+    const key = ipKey(req);
     const bucket = authBuckets.get(key);
-    if (!bucket || bucket.resetAt < now) {
+    if (!bucket || bucket.resetAt <= now) {
         authBuckets.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
         next();
         return;
     }
     bucket.count += 1;
     if (bucket.count > AUTH_RATE_LIMIT) {
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
         res.status(429).json({ message: "धेरै पटक प्रयास गरियो। पाँच मिनेटपछि फेरि प्रयास गर्नुहोस्।" });
         return;
     }
     next();
 }
-const clampInt = (value, min, max, fallback) => {
-    if (!value)
-        return fallback;
-    const parsed = parseInt(value, 10);
-    if (Number.isNaN(parsed))
-        return fallback;
-    return Math.min(max, Math.max(min, parsed));
-};
 const PASSWORD_RESET_TTL_MINUTES = clampInt(process.env.PASSWORD_RESET_TTL_MINUTES, 5, 120, 30);
 const smtpTransport = SMTP_HOST && MAIL_FROM
     ? nodemailer_1.default.createTransport({
@@ -203,19 +280,20 @@ app.post("/api/polls/:id/vote", (req, res) => {
 });
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const parseDateBoundary = (value, endOfDay) => {
-    const text = typeof value === "string" ? value.trim().slice(0, 10) : "";
+    const text = value.trim().slice(0, 10);
     if (!DATE_PATTERN.test(text))
         return NaN;
     const time = endOfDay ? "T23:59:59.999Z" : "T00:00:00.000Z";
-    return new Date(`${text}${time}`).getTime();
+    const parsed = new Date(`${text}${time}`).getTime();
+    return Number.isNaN(parsed) ? NaN : parsed;
 };
 const slugMatches = (slug, q) => slug.split("-").some((part) => part.length >= 3 && part.startsWith(q));
 const filterNews = (req) => {
-    const q = (req.query.q || "").toLowerCase().trim().slice(0, 200);
-    const personality = (req.query.personality || "").toLowerCase();
-    const category = (req.query.category || "").toLowerCase();
-    const from = parseDateBoundary(req.query.from || "", false);
-    const to = parseDateBoundary(req.query.to || "", true);
+    const q = queryText(req.query.q).toLowerCase().trim();
+    const personality = queryText(req.query.personality, 100).toLowerCase();
+    const category = queryText(req.query.category, 100).toLowerCase();
+    const from = parseDateBoundary(queryText(req.query.from, 10), false);
+    const to = parseDateBoundary(queryText(req.query.to, 10), true);
     let result = newsFeed;
     if (!Number.isNaN(from)) {
         result = result.filter((n) => new Date(n.publishedAt).getTime() >= from);
@@ -270,8 +348,8 @@ const filterNews = (req) => {
 app.get("/api/news", (req, res) => {
     let result = filterNews(req);
     const total = result.length;
-    const page = clampInt(req.query.page, 1, 100000, 1);
-    const limit = clampInt(req.query.limit, 1, 50, 20);
+    const page = clampInt(queryText(req.query.page, 12), 1, 100000, 1);
+    const limit = clampInt(queryText(req.query.limit, 12), 1, 50, 20);
     const start = (page - 1) * limit;
     result = result.slice(start, start + limit);
     const countByCategory = {};
@@ -287,8 +365,8 @@ app.get("/api/news", (req, res) => {
     });
 });
 app.get("/api/news/featured", (req, res) => {
-    const excludeCategory = (req.query.excludeCategory || "").toLowerCase();
-    const excludePersonality = (req.query.excludePersonality || "").toLowerCase();
+    const excludeCategory = queryText(req.query.excludeCategory, 100).toLowerCase();
+    const excludePersonality = queryText(req.query.excludePersonality, 100).toLowerCase();
     const sorted = [...newsFeed].sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
     const picked = [];
     const seen = new Set();
@@ -328,8 +406,8 @@ app.get("/api/news/featured", (req, res) => {
     res.json({ data: picked });
 });
 app.get("/api/news/related", (req, res) => {
-    const category = req.query.category;
-    const excludeId = req.query.excludeId;
+    const category = queryText(req.query.category, 100);
+    const excludeId = queryText(req.query.excludeId, 100);
     const categoryNews = newsFeed.filter((n) => n.category === category && n.id !== excludeId);
     const otherNews = newsFeed.filter((n) => n.category !== category && n.id !== excludeId);
     res.json({
@@ -434,14 +512,13 @@ app.get("/api/submissions/:id", requireUser, (req, res) => {
     res.json({ data: submission });
 });
 const requireAdmin = (req, res, next) => {
-    const token = req.headers["x-admin-token"];
-    if (typeof token !== "string" || !adminSessions.has(token)) {
+    if (adminAuth.readSession(req.headers["x-admin-token"]) === null) {
         res.status(401).json({ message: "प्रशासक सत्र मिलेन। फेरि प्रवेश गर्नुहोस्।" });
         return;
     }
     next();
 };
-app.post("/api/auth/register", authRateLimit, async (req, res) => {
+app.post("/api/auth/register", authRateLimit, asyncRoute(async (req, res) => {
     const { name, email, password } = req.body ?? {};
     if (typeof name !== "string" || !name.trim()) {
         res.status(400).json({ message: "पूरा नाम आवश्यक छ।" });
@@ -459,8 +536,13 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
         res.status(400).json({ message: "पासवर्ड कम्तीमा ८ अक्षरको हुनुपर्छ।" });
         return;
     }
-    if ((0, users_1.findUserByEmail)(email)) {
-        res.status(409).json({ message: "यो इमेलबाट खाता पहिल्यै बनाइएको छ। प्रवेश गर्नुहोस्।" });
+    const existing = (0, users_1.findUserByEmail)(email);
+    if (existing) {
+        // Uniform response: a distinct status here would confirm which addresses
+        // are registered to anyone probing the endpoint.
+        res.status(200).json({
+            message: "यदि यो इमेल उपलब्ध छ भने खाता सक्रिय हुन्छ। अब प्रवेश गर्नुहोस्।",
+        });
         return;
     }
     try {
@@ -475,22 +557,25 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
             message: "खाता सफलतापूर्वक बनाइयो।",
         });
     }
-    catch {
+    catch (error) {
+        console.error("Registration failed:", error);
         res.status(500).json({ message: "खाता बनाउन सकिएन। पछि पुनः प्रयास गर्नुहोस्।" });
     }
-});
-app.post("/api/auth/login", authRateLimit, async (req, res) => {
+}));
+app.post("/api/auth/login", authRateLimit, asyncRoute(async (req, res) => {
     const { email, password } = req.body ?? {};
     if (typeof email !== "string" || !(0, users_1.isValidEmail)(email)) {
         res.status(400).json({ message: "वैध इमेल ठेगाना आवश्यक छ।" });
         return;
     }
-    if (typeof password !== "string" || !password) {
+    if (typeof password !== "string" || !password || password.length > 512) {
         res.status(400).json({ message: "पासवर्ड आवश्यक छ।" });
         return;
     }
     const user = (0, users_1.findUserByEmail)(email);
-    const valid = user ? await (0, users_1.verifyPassword)(password, user.passwordHash) : false;
+    // Always run a scrypt comparison so an unknown address costs the same
+    // wall-clock time as a known one.
+    const valid = await (0, users_1.verifyLoginPassword)(password, user);
     if (!user || !valid) {
         res.status(401).json({ message: "इमेल वा पासवर्ड गलत छ।" });
         return;
@@ -500,8 +585,8 @@ app.post("/api/auth/login", authRateLimit, async (req, res) => {
         data: { token, user: (0, users_1.toPublicUser)(user) },
         message: "फेरि स्वागत छ, " + user.name.split(" ")[0] + "।",
     });
-});
-app.post("/api/auth/forgot-password", authRateLimit, async (req, res) => {
+}));
+app.post("/api/auth/forgot-password", authRateLimit, asyncRoute(async (req, res) => {
     const { email } = req.body ?? {};
     const responseMessage = "If an account exists for that email, a password reset link has been sent.";
     if (typeof email !== "string" || !(0, users_1.isValidEmail)(email)) {
@@ -514,13 +599,17 @@ app.post("/api/auth/forgot-password", authRateLimit, async (req, res) => {
             const token = (0, users_1.createPasswordResetToken)(user.id, PASSWORD_RESET_TTL_MINUTES * 60000);
             await sendPasswordResetEmail({ to: user.email, name: user.name, token });
         }
-        catch {
-            console.error("Password reset email could not be sent. Check SMTP configuration.");
+        catch (error) {
+            console.error("Password reset email could not be sent. Check SMTP configuration.", error);
         }
     }
+    else {
+        // Burn comparable time so a reset request cannot enumerate accounts.
+        await (0, users_1.verifyLoginPassword)("", undefined);
+    }
     res.status(202).json({ message: responseMessage });
-});
-app.post("/api/auth/reset-password", authRateLimit, async (req, res) => {
+}));
+app.post("/api/auth/reset-password", authRateLimit, asyncRoute(async (req, res) => {
     const { token, password } = req.body ?? {};
     const resetToken = typeof token === "string" ? token.trim() : "";
     if (!resetToken || resetToken.length > 256) {
@@ -539,10 +628,11 @@ app.post("/api/auth/reset-password", authRateLimit, async (req, res) => {
         }
         res.json({ message: "पासवर्ड सफलतापूर्वक परिवर्तन भयो।" });
     }
-    catch {
+    catch (error) {
+        console.error("Password reset failed:", error);
         res.status(500).json({ message: "पासवर्ड परिवर्तन गर्न सकिएन। पछि पुनः प्रयास गर्नुहोस्।" });
     }
-});
+}));
 app.post("/api/auth/logout", requireUser, (req, res) => {
     (0, users_1.destroySession)(req.headers["x-user-token"]);
     res.json({ message: "सत्र समाप्त भयो।" });
@@ -551,23 +641,41 @@ app.get("/api/auth/me", requireUser, (req, res) => {
     const user = currentUser(req);
     res.json({ data: (0, users_1.toPublicUser)(user) });
 });
-app.post("/api/admin/login", (req, res) => {
+app.post("/api/admin/login", authRateLimit, asyncRoute(async (req, res) => {
     const { email, password } = req.body ?? {};
     if (typeof email !== "string" || typeof password !== "string") {
         res.status(400).json({ message: "इमेल र पासवर्ड आवश्यक छ।" });
         return;
     }
-    if (email.trim().toLowerCase() !== ADMIN_EMAIL.toLowerCase() || password !== ADMIN_PASSWORD) {
-        res.status(401).json({ message: "इमेल वा पासवर्ड गलत छ।" });
+    if (email.length > 320 || password.length > 512) {
+        res.status(400).json({ message: "इमेल र पासवर्ड आवश्यक छ।" });
         return;
     }
-    const token = crypto_1.default.randomBytes(32).toString("hex");
-    adminSessions.set(token, { createdAt: Date.now() });
-    res.json({ data: { token, email: ADMIN_EMAIL }, message: "प्रशासनमा स्वागत छ।" });
-});
+    const result = await adminAuth.login({ email, password, ip: ipKey(req) });
+    switch (result.status) {
+        case "unconfigured":
+            res.status(503).json({
+                message: "प्रशासक खाता सेट गरिएको छैन। सर्भर ADMIN_EMAIL र ADMIN_PASSWORD सेट गर्नुहोस्।",
+            });
+            return;
+        case "throttled":
+        case "locked":
+            res.setHeader("Retry-After", String(Math.max(1, Math.ceil(result.retryAfterMs / 1000))));
+            res.status(429).json({ message: "धेरै प्रयास भयो। केही बेरपछि फेरि प्रयास गर्नुहोस्।" });
+            return;
+        case "invalid":
+            res.status(401).json({ message: "इमेल वा पासवर्ड गलत छ।" });
+            return;
+        case "ok":
+            res.json({
+                data: { token: result.token, email: result.email },
+                message: "प्रशासनमा स्वागत छ।",
+            });
+            return;
+    }
+}));
 app.post("/api/admin/logout", requireAdmin, (req, res) => {
-    const token = req.headers["x-admin-token"];
-    adminSessions.delete(token);
+    adminAuth.destroySession(req.headers["x-admin-token"]);
     res.json({ message: "सत्र समाप्त भयो।" });
 });
 app.get("/api/admin/stats", requireAdmin, (_req, res) => {
@@ -602,7 +710,7 @@ app.delete("/api/admin/users/:id", requireAdmin, (req, res) => {
     res.json({ message: "प्रयोगकर्ता हटाइयो।" });
 });
 app.get("/api/admin/submissions", requireAdmin, (req, res) => {
-    const status = (req.query.status || "pending");
+    const status = (queryText(req.query.status, 20) || "pending");
     res.json({ data: (0, submissions_1.listSubmissions)(status) });
 });
 app.post("/api/admin/submissions/:id/approve", requireAdmin, (req, res) => {
@@ -841,15 +949,33 @@ app.delete("/api/admin/personalities/:slug", requireAdmin, (req, res) => {
 app.use("/api", (_req, res) => {
     res.status(404).json({ message: "अनुरोध गरिएको API मौजुद छैन।" });
 });
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
     if (err.message === "CORS not allowed for this origin") {
         res.status(403).json({ message: "अनुमति नभएको स्रोतबाट अनुरोध।" });
+        return;
+    }
+    if (err.type === "entity.too.large") {
+        res.status(413).json({ message: "अनुरोधको आकार धेरै ठूलो छ।" });
+        return;
+    }
+    if (err.type === "entity.parse.failed" || err instanceof SyntaxError) {
+        res.status(400).json({ message: "अनुरोधको ढाँचा मिलेन।" });
+        return;
+    }
+    const status = err.status ?? err.statusCode ?? 500;
+    console.error(`[error] ${req.method} ${req.originalUrl} -> ${status}`, err.stack ?? err.message);
+    if (status < 500) {
+        res.status(status).json({ message: "अनुरोध अस्वीकार भयो।" });
         return;
     }
     res.status(500).json({ message: "सर्भरमा समस्या भयो। पछि पुनः प्रयास गर्नुहोस्।" });
 });
 app.listen(PORT, () => {
     console.log(`न्युज API सर्भर चालू छ: http://localhost:${PORT}`);
-    console.log(`अनुमति स्रोतहरू: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "सबै (विकास)"}`);
+    console.log(`अनुमति स्रोतहरू: ${CORS_ALLOWLIST.length ? CORS_ALLOWLIST.join(", ") : "कुनै पनि (बन्द)"}`);
     console.log(`अगाडिको साइट (CORS): ${ORIGIN}`);
+    console.log(`आन्तरिक अनुरोध छुट: ${INTERNAL_API_TOKEN ? "सक्रिय" : "निष्क्रिय"}`);
+    if (!adminAuth.configured) {
+        console.warn("चेतावनी: प्रशासक खाता सेट छैन। ADMIN_EMAIL र ADMIN_PASSWORD (वा ADMIN_PASSWORD_HASH) सेट नगरे /api/admin/login ले 503 दिनेछ।");
+    }
 });
